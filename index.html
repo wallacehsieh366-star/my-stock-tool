@@ -373,6 +373,28 @@
     }
 
     // 3. 儲存資料 (寫入 Firestore)
+    // 🔥 [新增] 用來從券商明細反推價位統計，節省儲存空間
+function reconstructData(brokers) {
+    const priceStats = {};
+    brokers.forEach(b => {
+        if (b.details) {
+            Object.keys(b.details).forEach(pKey => {
+                const d = b.details[pKey];
+                const buy = d.buy || 0;
+                const sell = d.sell || 0;
+                if (!priceStats[pKey]) priceStats[pKey] = { totalVol: 0, brokers: [] };
+                priceStats[pKey].totalVol += buy; 
+                if (buy > 0 || sell > 0) {
+                    priceStats[pKey].brokers.push({ name: b.name, buy: buy, sell: sell });
+                }
+            });
+        }
+    });
+    const priceList = Object.keys(priceStats).map(k => ({
+        price: parseFloat(k), pKey: k, totalVol: priceStats[k].totalVol, brokers: priceStats[k].brokers
+    }));
+    return { priceStats, priceList };
+}
     async function saveCurrentData() {
         if (!currData || !currentStockId) { alert("無資料"); return; }
         
@@ -381,7 +403,7 @@
         btn.innerText = "☁️ 上傳中...";
 
         const dateStr = document.getElementById('dataDate').value;
-        const saveData = { brokers: currData.brokers, priceStats: currData.priceStats, priceList: currData.priceList };
+        const saveData = { brokers: currData.brokers }; // 瘦身版：只存券商明細
         
         const batch = db.batch();
 
@@ -445,6 +467,13 @@
     function loadFromHistory(stockId, date) {
         const data = currentHistoryData[date];
         if (data && data.brokers) {
+            // 🔥 [新增] 自動重建數據
+            if (!data.priceStats || !data.priceList) {
+                console.log("偵測到瘦身版資料，正在重建...");
+                const reconstructed = reconstructData(data.brokers);
+                data.priceStats = reconstructed.priceStats;
+                data.priceList = reconstructed.priceList;
+            }
             currData = data; 
             document.getElementById('dataDate').value = date;
             document.getElementById('overnightSection').style.display = 'none';
@@ -969,4 +998,5 @@
 </script>
 
 </body>
+
 </html>
