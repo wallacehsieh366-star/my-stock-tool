@@ -844,7 +844,7 @@ function reconstructData(brokers) {
     }
     
     function detectStockId(txt) { 
-        const m = txt.match(/股票代碼[^0-9="]*[="]*([0-9]{3,6})/); 
+        const m = txt.match(/(?:股票代碼|證券代碼)[^0-9="]*[="]*([0-9]{3,6})/); 
         if(m) { 
             const id = m[1]; 
             currentStockId = id; 
@@ -1000,3 +1000,4 @@ function reconstructData(brokers) {
 </body>
 
 </html>
+
