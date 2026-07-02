@@ -266,6 +266,7 @@
         "4764": "雙鍵",
         "5228": "鈺鎧",
         "6187": "萬潤",
+        "6213": "聯茂",
         "6727": "亞泰金屬",
         "8499": "鼎炫-KY"
     };
@@ -273,6 +274,7 @@
         { url: "https://openapi.twse.com.tw/v1/opendata/t187ap03_L", codeKey: "公司代號", nameKey: "公司簡稱" },
         { url: "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", codeKey: "SecuritiesCompanyCode", nameKey: "CompanyAbbreviation" }
     ];
+    const STOCK_CODE_QUERY_URL = "https://www.twse.com.tw/rwd/zh/api/codeQuery";
 
     let stockNameCache = { ...STOCK_NAMES };
     let stockListIds = [];
@@ -306,7 +308,7 @@
             const rows = await res.json();
             rows.forEach(row => {
                 const id = String(row[source.codeKey] || '').trim();
-                const name = String(row[source.nameKey] || '').trim();
+                const name = sanitizeStockName(row[source.nameKey]);
                 if (id && name) stockNameCache[id] = name;
             });
         }));
@@ -314,6 +316,59 @@
         if (failed.length) console.warn("部分股票名稱 OpenAPI 載入失敗，將使用雲端或內建名稱。", failed);
         if (stockListIds.length) renderStockList(stockListIds);
         if (currentStockId) document.getElementById('displayStockId').textContent = getStockDisplayName(currentStockId);
+    }
+
+    async function ensureStockName(id, detectedName = "") {
+        const cleanDetectedName = sanitizeStockName(detectedName);
+        const cachedName = sanitizeStockName(stockNameCache[id]);
+        if (cachedName) {
+            stockNameCache[id] = cachedName;
+            return cachedName;
+        }
+
+        try {
+            const queriedName = await queryOfficialStockName(id);
+            if (queriedName) return queriedName;
+        } catch (err) {
+            console.warn("股票名稱即時查詢失敗，改用備援來源。", err);
+        }
+
+        try {
+            await loadOfficialStockNames();
+        } catch (err) {
+            console.warn("股票名稱 OpenAPI 查詢失敗，改用檔案內名稱或內建名稱。", err);
+        }
+
+        if (stockNameCache[id]) return stockNameCache[id];
+        if (cleanDetectedName) {
+            stockNameCache[id] = cleanDetectedName;
+            return cleanDetectedName;
+        }
+        return "";
+    }
+
+    async function queryOfficialStockName(id) {
+        const res = await fetch(`${STOCK_CODE_QUERY_URL}?query=${encodeURIComponent(id)}`);
+        if (!res.ok) throw new Error(`${STOCK_CODE_QUERY_URL} ${res.status}`);
+
+        const data = await res.json();
+        const suggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+        const exact = suggestions.map(String).find(item => item.startsWith(`${id}\t`) || item.startsWith(`${id} `));
+        if (!exact) return "";
+
+        const rawName = exact.includes('\t') ? exact.split('\t')[1] : exact.replace(id, '').trim();
+        const name = sanitizeStockName(rawName);
+        if (name) stockNameCache[id] = name;
+        return name;
+    }
+
+    function normalizeStockNames(names) {
+        const result = {};
+        Object.entries(names || {}).forEach(([id, name]) => {
+            const cleanName = sanitizeStockName(name);
+            if (cleanName) result[id] = cleanName;
+        });
+        return result;
     }
 
     // 🔥 2. 初始化 Firebase
@@ -385,7 +440,7 @@
             if (doc.exists && doc.data().ids) {
                 const data = doc.data();
                 stockListIds = data.ids || [];
-                stockNameCache = { ...stockNameCache, ...(data.names || {}) };
+                stockNameCache = { ...stockNameCache, ...normalizeStockNames(data.names || {}) };
                 renderStockList(stockListIds);
             } else {
                 listDiv.innerHTML = '<span style="color:#999;">(歡迎使用，目前雲端是空的)</span>';
@@ -885,8 +940,9 @@ function reconstructData(brokers) {
             if(type==='curr') {
                 const stockInfo = detectStockInfo(text);
                 if(stockInfo.id) {
-                    if(stockInfo.name) {
-                        stockNameCache[stockInfo.id] = stockInfo.name;
+                    const stockName = await ensureStockName(stockInfo.id, stockInfo.name);
+                    if(stockName) {
+                        stockNameCache[stockInfo.id] = stockName;
                         if (stockListIds.length) renderStockList(stockListIds);
                     }
                     await selectStock(stockInfo.id);
@@ -923,8 +979,10 @@ function reconstructData(brokers) {
                 if (!name) {
                     const tokens = line.split(/[,\t ，]+/).map(t => sanitizeStockName(t)).filter(Boolean);
                     const idIndex = tokens.indexOf(id);
-                    const candidates = [tokens[idIndex + 1], tokens[idIndex - 1]];
-                    name = candidates.find(t => t && /[\u4e00-\u9fa5]/.test(t)) || "";
+                    if (idIndex >= 0) {
+                        const candidates = [tokens[idIndex + 1], tokens[idIndex - 1]];
+                        name = candidates.find(t => t && /[\u4e00-\u9fa5]/.test(t)) || "";
+                    }
                 }
                 if (name) break;
             }
@@ -937,7 +995,9 @@ function reconstructData(brokers) {
     function sanitizeStockName(name) {
         const cleaned = String(name || '').replace(/[="'()（）【】\[\]]/g, '').trim();
         if (!cleaned || /^\d+$/.test(cleaned)) return "";
-        if (/^(股票代碼|股票代號|證券代碼|證券代號|股票名稱|證券名稱|股票簡稱|證券簡稱|代碼|代號|名稱)$/.test(cleaned)) return "";
+        if (/^\d{4,6}[\u4e00-\u9fa5A-Za-z-]+/.test(cleaned)) return "";
+        if (/(股票代碼|股票代號|證券代碼|證券代號|股票名稱|證券名稱|股票簡稱|證券簡稱)/.test(cleaned)) return "";
+        if (/^(代碼|代號|名稱)$/.test(cleaned)) return "";
         return cleaned.slice(0, 20);
     }
 
