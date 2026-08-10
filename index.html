@@ -2242,7 +2242,8 @@
     let stockListIds = [];
 
     function getStockDisplayName(id) {
-        return stockNameCache[id] ? `${id} ${stockNameCache[id]}` : id;
+        const stockName = STOCK_NAMES[id] || stockNameCache[id];
+        return stockName ? `${id} ${stockName}` : id;
     }
 
     function renderStockList(ids) {
@@ -2402,7 +2403,8 @@
             if (doc.exists && doc.data().ids) {
                 const data = doc.data();
                 stockListIds = data.ids || [];
-                stockNameCache = { ...stockNameCache, ...normalizeStockNames(data.names || {}) };
+                // 內建清單是已驗證的備援資料，不可被雲端殘留的錯誤名稱覆蓋。
+                stockNameCache = { ...stockNameCache, ...normalizeStockNames(data.names || {}), ...STOCK_NAMES };
                 renderStockList(stockListIds);
             } else {
                 listDiv.innerHTML = '<span style="color:#999;">(歡迎使用，目前雲端是空的)</span>';
@@ -2487,7 +2489,7 @@ function reconstructData(brokers) {
 
         // B. 更新股票清單索引 (metadata/stock_list) -> 使用 arrayUnion 避免重複
         const metaRef = db.collection('metadata').doc('stock_list');
-        const stockName = stockNameCache[currentStockId] || "";
+        const stockName = STOCK_NAMES[currentStockId] || stockNameCache[currentStockId] || "";
         const metaData = { ids: firebase.firestore.FieldValue.arrayUnion(currentStockId) };
         if (stockName) metaData.names = { [currentStockId]: stockName };
         batch.set(metaRef, metaData, { merge: true });
