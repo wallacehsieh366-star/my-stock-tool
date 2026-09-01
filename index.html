@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>籌碼日報 v12.0 (Firebase 雲端同步版)</title>
+    <title>籌碼日報 v12.1 (Firebase 雲端同步版)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     
     <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
@@ -110,7 +110,7 @@
 </div>
 
 <div class="container">
-    <h1>☁️ 籌碼日報 v12.0 (雲端同步版)</h1>
+    <h1>☁️ 籌碼日報 v12.1 (雲端同步版)</h1>
 
     <div id="riskAlert" class="risk-alert"></div>
 
@@ -2358,10 +2358,147 @@
     let ratioChartInstance = null;
     let brokerHabits = {}; 
     let activeBrokersLast30 = new Set();
+    const HISTORY_STORAGE_VERSION = 2;
+    const HISTORY_CHUNK_MARKER = "__chunk__";
+    const HISTORY_CHUNK_TARGET_BYTES = 600 * 1024;
+    const HISTORY_BROKER_FRAGMENT_BYTES = 180 * 1024;
     
     // 記憶體快取 (從雲端拉下來後暫存這裡)
-    let currentHistoryData = {}; 
+    let currentHistoryData = {};
     let unsubscribeHistory = null; // 用來取消監聽
+
+    function estimateJsonBytes(value) {
+        return new TextEncoder().encode(JSON.stringify(value)).length;
+    }
+
+    function makeBrokerRow(broker, brokerIndex, details) {
+        return [
+            brokerIndex,
+            broker.name || "",
+            broker.totalBuy || 0,
+            broker.totalSell || 0,
+            broker.net || 0,
+            broker.avgBuy || 0,
+            broker.avgSell || 0,
+            broker.dayTradeVol || 0,
+            broker.dayTradeProfit || 0,
+            details
+        ];
+    }
+
+    function encodeBrokerRows(brokers) {
+        const rows = [];
+        (brokers || []).forEach((broker, brokerIndex) => {
+            const details = Object.entries(broker.details || {}).map(([price, value]) => [
+                price,
+                value.buy || 0,
+                value.sell || 0
+            ]);
+
+            if (details.length === 0) {
+                rows.push(makeBrokerRow(broker, brokerIndex, []));
+                return;
+            }
+
+            let fragment = [];
+            details.forEach(detail => {
+                const candidate = [...fragment, detail];
+                if (fragment.length > 0 && estimateJsonBytes(makeBrokerRow(broker, brokerIndex, candidate)) > HISTORY_BROKER_FRAGMENT_BYTES) {
+                    rows.push(makeBrokerRow(broker, brokerIndex, fragment));
+                    fragment = [detail];
+                } else {
+                    fragment = candidate;
+                }
+            });
+            if (fragment.length > 0) rows.push(makeBrokerRow(broker, brokerIndex, fragment));
+        });
+        return rows;
+    }
+
+    function buildHistoryChunks(brokers) {
+        const chunks = [];
+        let currentRows = [];
+
+        encodeBrokerRows(brokers).forEach(row => {
+            const candidate = [...currentRows, row];
+            if (currentRows.length > 0 && estimateJsonBytes(candidate) > HISTORY_CHUNK_TARGET_BYTES) {
+                chunks.push(currentRows);
+                currentRows = [row];
+            } else {
+                currentRows = candidate;
+            }
+        });
+
+        if (currentRows.length > 0) chunks.push(currentRows);
+        return chunks.length > 0 ? chunks : [[]];
+    }
+
+    function decodeBrokerChunks(chunkDocuments) {
+        const brokerMap = new Map();
+        chunkDocuments
+            .sort((a, b) => (a.chunkIndex || 0) - (b.chunkIndex || 0))
+            .forEach(chunk => {
+                let rows = [];
+                try {
+                    rows = chunk.payload ? JSON.parse(chunk.payload) : (chunk.rows || []);
+                } catch (error) {
+                    console.error("歷史資料分段格式錯誤", error);
+                }
+                rows.forEach(row => {
+                    const [brokerIndex, name, totalBuy, totalSell, net, avgBuy, avgSell, dayTradeVol, dayTradeProfit, details] = row;
+                    if (!brokerMap.has(brokerIndex)) {
+                        brokerMap.set(brokerIndex, {
+                            brokerIndex,
+                            name,
+                            totalBuy,
+                            totalSell,
+                            net,
+                            avgBuy,
+                            avgSell,
+                            dayTradeVol,
+                            dayTradeProfit,
+                            details: {}
+                        });
+                    }
+                    const broker = brokerMap.get(brokerIndex);
+                    (details || []).forEach(([price, buy, sell]) => {
+                        broker.details[price] = { buy, sell };
+                    });
+                });
+            });
+
+        return [...brokerMap.values()]
+            .sort((a, b) => a.brokerIndex - b.brokerIndex)
+            .map(({ brokerIndex, ...broker }) => broker);
+    }
+
+    function hydrateHistorySnapshot(snapshot) {
+        const history = {};
+        const chunksByDate = {};
+
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            if (doc.id.includes(HISTORY_CHUNK_MARKER) && data.storageVersion === HISTORY_STORAGE_VERSION && data.date) {
+                if (!chunksByDate[data.date]) chunksByDate[data.date] = [];
+                chunksByDate[data.date].push(data);
+            } else {
+                history[doc.id] = data;
+            }
+        });
+
+        Object.entries(history).forEach(([date, data]) => {
+            if (data.storageVersion !== HISTORY_STORAGE_VERSION) return;
+            const chunks = chunksByDate[date] || [];
+            const expected = data.chunkCount || 0;
+            history[date] = {
+                ...data,
+                brokers: decodeBrokerChunks(chunks),
+                storageIncomplete: chunks.length !== expected
+            };
+        });
+
+        return history;
+    }
 
     document.getElementById('dataDate').valueAsDate = new Date();
     
@@ -2433,10 +2570,7 @@
         // 🔥 即時監聽該股票的 history 子集合
         unsubscribeHistory = db.collection('stocks').doc(id).collection('history')
             .onSnapshot(snapshot => {
-                currentHistoryData = {};
-                snapshot.forEach(doc => {
-                    currentHistoryData[doc.id] = doc.data();
-                });
+                currentHistoryData = hydrateHistorySnapshot(snapshot);
                 
                 // 資料載入完成，更新畫面
                 loadDateList(id);
@@ -2479,22 +2613,44 @@ function reconstructData(brokers) {
         btn.innerText = "☁️ 上傳中...";
 
         const dateStr = document.getElementById('dataDate').value;
-        const saveData = { brokers: currData.brokers }; // 瘦身版：只存券商明細
-        
-        const batch = db.batch();
-
-        // A. 寫入歷史資料 (stocks/{id}/history/{date})
-        const docRef = db.collection('stocks').doc(currentStockId).collection('history').doc(dateStr);
-        batch.set(docRef, saveData);
-
-        // B. 更新股票清單索引 (metadata/stock_list) -> 使用 arrayUnion 避免重複
-        const metaRef = db.collection('metadata').doc('stock_list');
-        const stockName = STOCK_NAMES[currentStockId] || stockNameCache[currentStockId] || "";
-        const metaData = { ids: firebase.firestore.FieldValue.arrayUnion(currentStockId) };
-        if (stockName) metaData.names = { [currentStockId]: stockName };
-        batch.set(metaRef, metaData, { merge: true });
 
         try {
+            const chunks = buildHistoryChunks(currData.brokers);
+            const historyRef = db.collection('stocks').doc(currentStockId).collection('history');
+            const docRef = historyRef.doc(dateStr);
+            const chunkPrefix = `${dateStr}${HISTORY_CHUNK_MARKER}`;
+            const existingChunks = await historyRef
+                .where(firebase.firestore.FieldPath.documentId(), '>=', chunkPrefix)
+                .where(firebase.firestore.FieldPath.documentId(), '<', `${chunkPrefix}\uf8ff`)
+                .get();
+
+            const batch = db.batch();
+            existingChunks.forEach(doc => batch.delete(doc.ref));
+
+            batch.set(docRef, {
+                storageVersion: HISTORY_STORAGE_VERSION,
+                chunkCount: chunks.length,
+                brokerCount: currData.brokers.length,
+                savedAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+
+            chunks.forEach((rows, chunkIndex) => {
+                const chunkId = `${chunkPrefix}${String(chunkIndex).padStart(4, '0')}`;
+                batch.set(historyRef.doc(chunkId), {
+                    storageVersion: HISTORY_STORAGE_VERSION,
+                    date: dateStr,
+                    chunkIndex,
+                    payload: JSON.stringify(rows)
+                });
+            });
+
+            // 更新股票清單索引 (metadata/stock_list) -> 使用 arrayUnion 避免重複
+            const metaRef = db.collection('metadata').doc('stock_list');
+            const stockName = STOCK_NAMES[currentStockId] || stockNameCache[currentStockId] || "";
+            const metaData = { ids: firebase.firestore.FieldValue.arrayUnion(currentStockId) };
+            if (stockName) metaData.names = { [currentStockId]: stockName };
+            batch.set(metaRef, metaData, { merge: true });
+
             await batch.commit();
             
             document.getElementById('saveStatus').style.display = 'inline'; 
@@ -2515,7 +2671,16 @@ function reconstructData(brokers) {
     async function deleteHistory(id, date) {
         if(confirm(`確定要從雲端刪除 ${id} 在 ${date} 的資料嗎?`)) {
             try {
-                await db.collection('stocks').doc(id).collection('history').doc(date).delete();
+                const historyRef = db.collection('stocks').doc(id).collection('history');
+                const chunkPrefix = `${date}${HISTORY_CHUNK_MARKER}`;
+                const chunks = await historyRef
+                    .where(firebase.firestore.FieldPath.documentId(), '>=', chunkPrefix)
+                    .where(firebase.firestore.FieldPath.documentId(), '<', `${chunkPrefix}\uf8ff`)
+                    .get();
+                const batch = db.batch();
+                chunks.forEach(doc => batch.delete(doc.ref));
+                batch.delete(historyRef.doc(date));
+                await batch.commit();
                 // 監聽器會自動更新
             } catch(e) { alert("刪除失敗:" + e.message); }
         }
@@ -2543,6 +2708,10 @@ function reconstructData(brokers) {
 
     function loadFromHistory(stockId, date) {
         const data = currentHistoryData[date];
+        if (data && data.storageIncomplete) {
+            alert("歷史資料分段尚未完整載入，請稍候再試；若持續發生，請檢查 Firebase 權限設定。");
+            return;
+        }
         if (data && data.brokers) {
             // 🔥 [新增] 自動重建數據
             if (!data.priceStats || !data.priceList) {
