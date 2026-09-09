@@ -68,9 +68,9 @@
         .simple-link { font-size: 10px; padding: 1px 3px; margin-left: 3px; border: 1px solid #ddd; color: #666; text-decoration: none; border-radius: 3px; background: #f8f9fa; }
         
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.5); }
-        .modal-content { background-color: #fefefe; margin: 5% auto; padding: 20px; border: 1px solid #888; width: 90%; max-width: 800px; border-radius: 8px; }
+        .modal-content { background-color: #fefefe; margin: 4% auto; padding: 20px; border: 1px solid #888; width: 92%; max-width: 1050px; border-radius: 8px; }
         .close { float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
-        #chartContainer { position: relative; height: 400px; width: 100%; }
+        #chartContainer { position: relative; height: 440px; width: 100%; }
         
         .detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 15px; margin-top: 15px; }
         .detail-card { border: 1px solid #eee; padding: 10px; border-radius: 5px; background: #fff; border-top: 3px solid #ccc; min-height: 200px; display: flex; flex-direction: column; }
@@ -2233,12 +2233,14 @@
         "912000": "晨訊科-DR"
     };
     const STOCK_NAME_SOURCES = [
-        { url: "https://openapi.twse.com.tw/v1/opendata/t187ap03_L", codeKey: "公司代號", nameKey: "公司簡稱" },
-        { url: "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", codeKey: "SecuritiesCompanyCode", nameKey: "CompanyAbbreviation" }
+        { market: "twse", url: "https://openapi.twse.com.tw/v1/opendata/t187ap03_L", codeKey: "公司代號", nameKey: "公司簡稱" },
+        { market: "tpex", url: "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", codeKey: "SecuritiesCompanyCode", nameKey: "CompanyAbbreviation" }
     ];
     const STOCK_CODE_QUERY_URL = "https://www.twse.com.tw/rwd/zh/api/codeQuery";
+    const TPEX_CORS_PROXY = "https://r.jina.ai/http://";
 
     let stockNameCache = { ...STOCK_NAMES };
+    let stockMarketCache = {};
     let stockListIds = [];
 
     function getStockDisplayName(id) {
@@ -2272,6 +2274,7 @@
             rows.forEach(row => {
                 const id = String(row[source.codeKey] || '').trim();
                 const name = sanitizeStockName(row[source.nameKey]);
+                if (id) stockMarketCache[id] = source.market;
                 if (id && name) stockNameCache[id] = name;
             });
         }));
@@ -2353,8 +2356,10 @@
     let prevData = null; 
     let currData = null; 
     let globalPriceStats = {};
-    let currentStockId = ""; 
-    let chartInstance = null; 
+    let currentStockId = "";
+    let chartInstance = null;
+    let chartRequestToken = 0;
+    const closingPriceMonthCache = new Map();
     let ratioChartInstance = null;
     let brokerHabits = {}; 
     let activeBrokersLast30 = new Set();
@@ -3232,9 +3237,187 @@ function reconstructData(brokers) {
     }
     
     function formatNum(num) { return isNaN(num) ? "0" : num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
-    
-    function openChart(n) {
+
+    function normalizeOfficialTradeDate(value) {
+        const parts = String(value || '').trim().split('/').map(Number);
+        if (parts.length !== 3 || parts.some(part => !Number.isFinite(part))) return '';
+        const year = parts[0] < 1911 ? parts[0] + 1911 : parts[0];
+        return `${year}-${String(parts[1]).padStart(2, '0')}-${String(parts[2]).padStart(2, '0')}`;
+    }
+
+    function parseOfficialPrice(value) {
+        const price = Number(String(value || '').replace(/,/g, '').trim());
+        return Number.isFinite(price) && price > 0 ? price : null;
+    }
+
+    function getClosingPriceUrl(market, stockId, month) {
+        const year = month.slice(0, 4);
+        const monthNumber = month.slice(4, 6);
+        if (market === 'twse') {
+            return `https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date=${month}01&stockNo=${encodeURIComponent(stockId)}&response=json`;
+        }
+        return `https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=${encodeURIComponent(stockId)}&date=${year}/${monthNumber}/01&id=&response=json`;
+    }
+
+    function parseClosingPriceResponse(market, payload) {
+        const result = {};
+        let rows = [];
+        if (market === 'twse' && payload && payload.stat === 'OK') {
+            rows = Array.isArray(payload.data) ? payload.data : [];
+        } else if (market === 'tpex' && payload && String(payload.stat).toLowerCase() === 'ok') {
+            rows = payload.tables && payload.tables[0] && Array.isArray(payload.tables[0].data)
+                ? payload.tables[0].data
+                : [];
+        }
+        rows.forEach(row => {
+            const date = normalizeOfficialTradeDate(row[0]);
+            const close = parseOfficialPrice(row[6]);
+            if (date && close !== null) result[date] = close;
+        });
+        return result;
+    }
+
+    async function fetchClosingPriceMonth(stockId, month, market) {
+        const cacheKey = `${market}:${stockId}:${month}`;
+        if (closingPriceMonthCache.has(cacheKey)) return closingPriceMonthCache.get(cacheKey);
+
+        const officialUrl = getClosingPriceUrl(market, stockId, month);
+        // 櫃買中心的歷史端點沒有開放瀏覽器 CORS，僅轉送公開查價 URL，不含使用者資料。
+        const requestUrl = market === 'tpex' ? `${TPEX_CORS_PROXY}${officialUrl}` : officialUrl;
+        const request = fetch(requestUrl, { cache: 'no-store' })
+            .then(response => {
+                if (!response.ok) throw new Error(`${market.toUpperCase()} ${response.status}`);
+                return response.json();
+            })
+            .then(payload => {
+                if (market === 'tpex' && payload && payload.data && payload.data.content) {
+                    return JSON.parse(payload.data.content);
+                }
+                return payload;
+            })
+            .then(payload => parseClosingPriceResponse(market, payload));
+
+        closingPriceMonthCache.set(cacheKey, request);
+        try {
+            return await request;
+        } catch (error) {
+            closingPriceMonthCache.delete(cacheKey);
+            throw error;
+        }
+    }
+
+    async function getClosingPrices(stockId, dates) {
+        const months = [...new Set(dates.map(date => date.slice(0, 7).replace('-', '')))];
+        if (months.length === 0) return { prices: {}, market: '' };
+
+        let market = stockMarketCache[stockId] || '';
+        const prices = {};
+
+        if (!market) {
+            for (const candidate of ['twse', 'tpex']) {
+                try {
+                    const firstMonth = await fetchClosingPriceMonth(stockId, months[0], candidate);
+                    if (Object.keys(firstMonth).length > 0) {
+                        market = candidate;
+                        stockMarketCache[stockId] = candidate;
+                        Object.assign(prices, firstMonth);
+                        break;
+                    }
+                } catch (error) {
+                    console.warn(`${candidate.toUpperCase()} 收盤價查詢失敗`, error);
+                }
+            }
+        }
+
+        if (!market) return { prices, market: '' };
+
+        const pendingMonths = months.filter(month => !Object.keys(prices).some(date => date.startsWith(`${month.slice(0, 4)}-${month.slice(4, 6)}`)));
+        const monthlyResults = await Promise.allSettled(
+            pendingMonths.map(month => fetchClosingPriceMonth(stockId, month, market))
+        );
+        monthlyResults.forEach(result => {
+            if (result.status === 'fulfilled') Object.assign(prices, result.value);
+            else console.warn('部分月份收盤價載入失敗', result.reason);
+        });
+        return { prices, market };
+    }
+
+    function renderBrokerHistoryChart(labels, brokerValues, closingValues = []) {
+        const ctx = document.getElementById('brokerChart').getContext('2d');
+        if (chartInstance) chartInstance.destroy();
+
+        const datasets = [{
+            type: 'bar',
+            label: '買賣超（張）',
+            data: brokerValues,
+            yAxisID: 'yBroker',
+            backgroundColor: brokerValues.map(value => value >= 0 ? 'rgba(220, 53, 69, 0.86)' : 'rgba(40, 167, 69, 0.86)'),
+            borderWidth: 0,
+            order: 2
+        }];
+
+        if (closingValues.some(value => Number.isFinite(value))) {
+            datasets.push({
+                type: 'line',
+                label: '收盤價',
+                data: closingValues,
+                yAxisID: 'yPrice',
+                borderColor: 'rgba(30, 64, 175, 0.62)',
+                backgroundColor: 'rgba(30, 64, 175, 0.12)',
+                pointBackgroundColor: 'rgba(30, 64, 175, 0.72)',
+                pointBorderColor: 'rgba(255, 255, 255, 0.9)',
+                pointRadius: 2.5,
+                pointHoverRadius: 5,
+                borderWidth: 2.5,
+                tension: 0.22,
+                spanGaps: true,
+                fill: false,
+                order: 1
+            });
+        }
+
+        chartInstance = new Chart(ctx, {
+            type: 'bar',
+            data: { labels, datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'top' },
+                    tooltip: {
+                        callbacks: {
+                            label(context) {
+                                const value = context.parsed.y;
+                                if (context.dataset.yAxisID === 'yPrice') return ` 收盤價：${value}`;
+                                return ` 買賣超：${formatNum(value)} 張`;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: { ticks: { maxRotation: 50, minRotation: 35 } },
+                    yBroker: {
+                        type: 'linear',
+                        position: 'left',
+                        title: { display: true, text: '買賣超（張）' },
+                        grid: { color: 'rgba(0, 0, 0, 0.08)' }
+                    },
+                    yPrice: {
+                        type: 'linear',
+                        position: 'right',
+                        display: closingValues.some(value => Number.isFinite(value)),
+                        title: { display: true, text: '收盤價' },
+                        grid: { drawOnChartArea: false }
+                    }
+                }
+            }
+        });
+    }
+
+    async function openChart(n) {
         if(!currentStockId) return;
+        const requestToken = ++chartRequestToken;
         const h = currentHistoryData; // 直接讀取
         const ds = Object.keys(h).sort();
         const vs=[], ls=[];
@@ -3255,12 +3438,33 @@ function reconstructData(brokers) {
         document.getElementById('modalTitle').innerText=`${n} - 歷史買賣`;
         const totLot = Math.floor(tot/1000); const tc = totLot>=0?'#dc3545':'#28a745'; const ts=totLot>0?'+':'';
         document.getElementById('modalTotal').innerHTML=`區間累計: <span style="color:${tc}">${ts}${formatNum(totLot)} 張</span>`;
-        const ctx=document.getElementById('brokerChart').getContext('2d');
-        if(chartInstance) chartInstance.destroy();
-        chartInstance=new Chart(ctx, {type:'bar', data:{labels:ls, datasets:[{label:'張', data:vs, backgroundColor:vs.map(v=>v>=0?'#dc3545':'#28a745')}]}, options:{maintainAspectRatio:false}});
+        const chartMsg = document.getElementById('chartMsg');
+        chartMsg.innerText = '收盤價載入中...';
+        renderBrokerHistoryChart(ls, vs);
+
+        try {
+            const { prices, market } = await getClosingPrices(currentStockId, ls);
+            if (requestToken !== chartRequestToken) return;
+            const closingValues = ls.map(date => prices[date] ?? null);
+            const matchedCount = closingValues.filter(value => Number.isFinite(value)).length;
+            if (matchedCount > 0) {
+                renderBrokerHistoryChart(ls, vs, closingValues);
+                const sourceName = market === 'twse' ? '臺灣證券交易所' : '證券櫃檯買賣中心';
+                chartMsg.innerText = `收盤價資料來源：${sourceName}（${matchedCount}/${ls.length} 個日期）`;
+            } else {
+                chartMsg.innerText = '查無相同日期的收盤價，暫時只顯示分點買賣超。';
+            }
+        } catch (error) {
+            if (requestToken !== chartRequestToken) return;
+            console.warn('收盤價載入失敗', error);
+            chartMsg.innerText = '收盤價目前無法載入，分點買賣超仍可正常查看。';
+        }
     }
-    
-    function closeModal() { document.getElementById('chartModal').style.display='none'; }
+
+    function closeModal() {
+        chartRequestToken++;
+        document.getElementById('chartModal').style.display='none';
+    }
     window.onclick = function(e) { if(e.target==document.getElementById('chartModal')) closeModal(); }
     
     function renderForeignStats(buy, sell) {
