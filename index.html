@@ -197,6 +197,9 @@
             <div id="domesticStats" style="display:contents;"></div>
         </div>
 
+        <p id="foreignStatsSource" role="status" aria-live="polite" style="color:#495057; line-height:1.6;"></p>
+        <details id="foreignBrokerStats" style="padding:12px; background:#f8f9fa; border:1px solid #ddd; border-radius:5px;"></details>
+
         <div class="row">
             <div class="col">
                 <div class="section-title" style="border-left-color: #dc3545;">🔴 買超前 20 大排行</div>
@@ -248,7 +251,7 @@
 </div>
 
 <script>
-    const FOREIGN_BROKERS = ["摩根大通", "摩根士丹利", "瑞銀", "凱基台北", "美林", "高盛", "野村", "匯豐", "大和國泰", "台灣匯立", "花旗", "麥格理", "瑞士信貸", "新加坡商瑞銀", "港商野村", "法國興業"];
+    const TRACKED_FOREIGN_BROKERS = ["摩根大通", "摩根士丹利", "瑞銀", "美林", "高盛", "野村", "匯豐", "大和國泰", "台灣匯立", "花旗", "麥格理", "瑞士信貸", "新加坡商瑞銀", "港商野村", "法國興業"];
     const DOMESTIC_MAINS = ["凱基信義", "富邦新店", "群益金鼎大安", "凱基松山", "凱基市政", "凱基台北", "富邦台北", "富邦建國", "永豐金信義", "凱基城中", "元大館前", "華南永昌中正", "國票安和", "元富松德", "國票敦北", "統一城中", "群益金鼎內湖", "凱基敦北", "永豐金敦北", "華南永昌南京", "兆豐大同", "國泰台中"];
     const STOCK_NAMES = {
         "1101": "台泥",
@@ -2559,6 +2562,7 @@
 
     // 2. 選擇股票 (載入該股票所有歷史)
     async function selectStock(id) {
+        resetOfficialForeignStats();
         currentStockId = id;
         document.getElementById('displayStockId').textContent = getStockDisplayName(id);
         document.getElementById('stockInfoBar').style.display = 'block';
@@ -3033,8 +3037,9 @@ function reconstructData(brokers) {
         renderRatioChart(currentStockId);
         try {
             let fBuy = 0, fSell = 0;
-            data.brokers.forEach(b => { if (FOREIGN_BROKERS.some(fb => b.name.includes(fb))) { fBuy += b.totalBuy; fSell += b.totalSell; } });
-            renderForeignStats(fBuy, fSell);
+            data.brokers.forEach(b => { if (TRACKED_FOREIGN_BROKERS.some(fb => b.name.includes(fb))) { fBuy += b.totalBuy; fSell += b.totalSell; } });
+            renderForeignBrokerStats(fBuy, fSell);
+            loadOfficialForeignStats();
             renderDomesticStats(data);
         } catch(e) {}
         try {
@@ -3465,12 +3470,148 @@ function reconstructData(brokers) {
         chartRequestToken++;
         document.getElementById('chartModal').style.display='none';
     }
+    document.getElementById('dataDate').addEventListener('input', () => resetOfficialForeignStats('日期已變更，請載入對應日期資料或重新分析。'));
     window.onclick = function(e) { if(e.target==document.getElementById('chartModal')) closeModal(); }
     
-    function renderForeignStats(buy, sell) {
-        const b = Math.floor(buy/1000), s = Math.floor(sell/1000), n = b-s;
-        document.getElementById('foreignStats').innerHTML = `<div class="card"><h3>外資總買進</h3><div class="big-number red">${formatNum(b)} 張</div></div><div class="card"><h3>外資總賣出</h3><div class="big-number green">${formatNum(s)} 張</div></div><div class="card"><h3>外資買賣超</h3><div class="big-number ${n>=0?'red':'green'}">${n>0?'+':''}${formatNum(n)} 張</div></div>`;
+    // Official investor statistics and broker activity have different scopes.
+    const officialForeignCache = new Map();
+    let foreignStatsRequestToken = 0;
+
+    function foreignShares(value) {
+        const text = String(value ?? '').replace(/,/g, '').trim();
+        if (!/^-?\d+$/.test(text)) throw new Error('官方股數格式不符');
+        const number = Number(text);
+        if (!Number.isSafeInteger(number)) throw new Error('官方股數超出範圍');
+        return number;
     }
+
+    function foreignReportUrl(market, date) {
+        return market === 'twse'
+            ? `https://www.twse.com.tw/rwd/zh/fund/TWT38U?date=${date.replace(/-/g, '')}&response=json`
+            : `https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade?date=${date.replace(/-/g, '/')}&type=Daily&sect=AL&id=&response=json`;
+    }
+
+    function parseForeignReport(market, payload, date) {
+        const rows = new Map();
+        const compactDate = date.replace(/-/g, '');
+        const tables = market === 'twse' ? [payload] : payload?.tables;
+        if (!Array.isArray(tables)) throw new Error('官方資料尚未公布或格式不符');
+        if (market === 'twse' && (payload.stat !== 'OK' || payload.date !== compactDate)) {
+            throw new Error('官方資料日期不符或尚未公布');
+        }
+        let validTable = false;
+        tables.forEach(table => {
+            if (market === 'tpex' && normalizeOfficialTradeDate(table.date) !== date) return;
+            if (!Array.isArray(table.data) || !Array.isArray(table.fields)) return;
+            const idIndex = market === 'twse' ? 1 : 0;
+            // TWT38U: total foreign investors at 9-11; TPEx dailyTrade: 8-10.
+            // Both include foreign dealers, matching the user's official total column.
+            const buyIndex = market === 'twse' ? 9 : 8;
+            if (!/買進股數/.test(table.fields[buyIndex]) || !/賣出股數/.test(table.fields[buyIndex + 1]) ||
+                !/買賣超股數/.test(table.fields[buyIndex + 2])) return;
+            validTable = true;
+            table.data.forEach(row => {
+                const id = String(row[idIndex] || '').trim();
+                if (!/^[0-9A-Za-z]{4,6}$/.test(id)) return;
+                const buy = foreignShares(row[buyIndex]);
+                const sell = foreignShares(row[buyIndex + 1]);
+                const net = foreignShares(row[buyIndex + 2]);
+                if (buy < 0 || sell < 0 || buy - sell !== net) throw new Error('官方買賣股數不一致');
+                rows.set(id, { buy, sell, net, market, date });
+            });
+        });
+        if (!validTable || !rows.size) throw new Error('官方資料尚未公布或格式不符');
+        return rows;
+    }
+
+    async function fetchForeignReport(market, date) {
+        const key = `${market}:${date}`;
+        const cached = officialForeignCache.get(key);
+        if (cached && Date.now() - cached.time < 300000) return cached.promise;
+        const promise = (async () => {
+            const url = foreignReportUrl(market, date);
+            // Reuse the site's public-data proxy only if the official endpoint blocks CORS.
+            const urls = [url, `${TPEX_CORS_PROXY}${url}`];
+            for (let index = 0; index < urls.length; index++) {
+                try {
+                    const response = await fetch(urls[index], { cache: 'no-store', signal: AbortSignal.timeout(15000) });
+                    if (!response.ok) throw new Error(`官方資料連線失敗 (${response.status})`);
+                    let payload = await response.json();
+                    if (payload?.data?.content) payload = JSON.parse(payload.data.content);
+                    return parseForeignReport(market, payload, date);
+                } catch (error) {
+                    if (index === urls.length - 1) throw error;
+                }
+            }
+        })();
+        officialForeignCache.set(key, { time: Date.now(), promise });
+        try { return await promise; }
+        catch (error) { officialForeignCache.delete(key); throw error; }
+    }
+
+    function formatForeignLots(shares) {
+        return (shares / 1000).toLocaleString('zh-TW', { minimumFractionDigits: 0, maximumFractionDigits: 3 });
+    }
+
+    function renderForeignStats(record) {
+        const values = record ? [record.buy, record.sell, record.net] : [null, null, null];
+        const titles = ['外資及陸資總買進（官方）', '外資及陸資總賣出（官方）', '外資及陸資買賣超（官方）'];
+        document.getElementById('foreignStats').innerHTML = values.map((value, index) => {
+            const color = value === null ? '' : (index === 1 || (index === 2 && value < 0) ? 'green' : 'red');
+            const text = value === null ? '—' : `${index === 2 && value > 0 ? '+' : ''}${formatForeignLots(value)} 張`;
+            return `<div class="card"><h3>${titles[index]}</h3><div class="big-number ${color}">${text}</div></div>`;
+        }).join('');
+    }
+
+    function renderForeignBrokerStats(buy, sell) {
+        document.getElementById('foreignBrokerStats').innerHTML = `<summary>指定外資券商分點合計（非官方外資統計）</summary><p>買進 ${formatForeignLots(buy)} 張 ／ 賣出 ${formatForeignLots(sell)} 張 ／ 買賣超 ${buy - sell > 0 ? '+' : ''}${formatForeignLots(buy - sell)} 張</p><p>依指定券商名稱加總全部分點成交，不代表投資人身分；已移除凱基台北，該分點仍保留於內資主力觀察。</p>`;
+    }
+
+    function resetOfficialForeignStats(message = '請載入對應股號及日期的資料。') {
+        foreignStatsRequestToken++;
+        renderForeignStats(null);
+        document.getElementById('foreignStatsSource').textContent = message;
+    }
+
+    async function loadOfficialForeignStats() {
+        const token = ++foreignStatsRequestToken;
+        const stockId = currentStockId;
+        const date = document.getElementById('dataDate').value;
+        const source = document.getElementById('foreignStatsSource');
+        renderForeignStats(null);
+        if (!/^[0-9A-Za-z]{4,6}$/.test(stockId) || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+            source.textContent = '請先選擇有效的股號與資料日期。';
+            return;
+        }
+        source.textContent = `${stockId}｜${date}｜官方資料載入中…`;
+        const isCurrent = () => token === foreignStatsRequestToken && stockId === currentStockId && date === document.getElementById('dataDate').value;
+        const knownMarket = stockMarketCache[stockId];
+        const markets = knownMarket ? [knownMarket] : ['twse', 'tpex'];
+        let record;
+        try {
+            record = await Promise.any(markets.map(async market => {
+                const rows = await fetchForeignReport(market, date);
+                const match = rows.get(stockId);
+                if (!match) throw new Error('此市場無該股號');
+                return match;
+            }));
+        } catch (error) { /* Keep official figures empty when neither source matches. */ }
+        if (!isCurrent()) return;
+        if (!record) {
+            source.textContent = `${stockId}｜${date}｜官方暫無資料或連線失敗，未以分點估算值代替。`;
+            const retry = document.createElement('button');
+            retry.className = 'btn btn-outline'; retry.textContent = '重試官方資料';
+            retry.onclick = () => loadOfficialForeignStats(); source.appendChild(retry);
+            return;
+        }
+        stockMarketCache[stockId] = record.market;
+        renderForeignStats(record);
+        source.textContent = `${stockId}｜${date}｜來源：${record.market === 'twse' ? '臺灣證券交易所' : '證券櫃檯買賣中心'}；外資及陸資合計（含外資自營商），1 張＝1,000 股，顯示至小數第 3 位。 `;
+        const link = document.createElement('a');
+        link.href = foreignReportUrl(record.market, date); link.target = '_blank'; link.rel = 'noopener noreferrer';
+        link.textContent = '查看官方原始資料'; source.appendChild(link);
+    }
+
     
     function renderDetails(eid, data, c) {
         let h='';
